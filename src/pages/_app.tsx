@@ -13,7 +13,6 @@ import { NextWebVitalsMetricsReport } from '@/modules/core/webVitals/types/NextW
 import size from 'lodash.size';
 import React from 'react';
 import { v1 as uuid } from 'uuid'; // XXX Use v1 for uniqueness - See https://www.sohamkamani.com/blog/2016/10/05/uuid1-vs-uuid4/
-import {ApolloProvider} from '@apollo/client';
 
 /**
  * "props.pageProps" will depend on whether the page is served by server or client, SSG or SSR
