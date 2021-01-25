@@ -14,11 +14,11 @@
       "LOCIZE_API_KEY": "@locize-api-key-production-je5y",
       "SENTRY_DSN": "",
       "GITHUB_DISPATCH_TOKEN": "@github-dispatch-token-production-vdd3",
-      "VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK": "https://nrn-v2-mst-aptd-at-lcz-sty-c1-preview.vercel.app/api/webhooks/deploymentCompleted"
+      "VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK": "https://nrn-sunstan.vercel.app/api/webhooks/deploymentCompleted"
 }
   },
   "alias": [
-    "nrn-v2-mst-aptd-at-lcz-sty-c1-preview.vercel.app"
+    "nrn-sunstan.vercel.app"
   ],
   "regions": [
     "cdg1"
