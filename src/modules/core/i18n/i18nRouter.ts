@@ -67,10 +67,13 @@ export const isActive = (router: NextRouter, path: string): boolean => {
   return (currentPaths?.[1] || currentPaths?.[0]) === path;
 };
 
-export const stringifyQueryParameters = (queries: {[key: string]: string}): string =>
-  !isEmpty(queries)
-    ? `?${new URLSearchParams(queries)}`
+export const stringifyQueryParameters = (router: NextRouter): string => {
+  const {locale, slug, ref, gender, ...queries} = router.query;
+
+  return !isEmpty(queries)
+    ? `?${new URLSearchParams(queries as {[key: string]: string})}`
     : '';
+  }
 
 /**
  * Returns the current page url, but for a different locale
@@ -80,7 +83,7 @@ export const stringifyQueryParameters = (queries: {[key: string]: string}): stri
  * @param router
  */
 export const getSamePageI18nUrl = (locale, router: NextRouter): string => {
-  const {locale: localQuery, slug, ref, gender, ...queries}: any = router.query;
+  const {slug, ref, gender}: any = router.query;
 
   let route = router.pathname
     .replace('[locale]', locale)
@@ -88,7 +91,7 @@ export const getSamePageI18nUrl = (locale, router: NextRouter): string => {
     .replace('[slug]', slug)
     .replace('[ref]', ref);
 
-  return `${route}${stringifyQueryParameters(queries)}`;
+  return `${route}${stringifyQueryParameters(router)}`;
 };
 
 /**
@@ -103,8 +106,7 @@ export const getSamePageI18nUrl = (locale, router: NextRouter): string => {
  */
 export const i18nRedirect = (locale, router: NextRouter, forcePageReload = false): void => {
   const newUrl = getSamePageI18nUrl(locale, router);
-  const {locale: localQuery, slug, ref, gender, ...queries}: any = router.query;
-  const queryParameters: string = stringifyQueryParameters(queries);
+  const queryParameters: string = stringifyQueryParameters(router);
 
   if (forcePageReload) location.href = newUrl;
   else router.push(router.pathname + queryParameters, newUrl);
