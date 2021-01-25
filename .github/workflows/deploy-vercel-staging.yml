@@ -1,0 +1,484 @@
+# Summary:
+# Creates a new preview deployment on Vercel's platform, when anything is pushed in any branch (except for the "master" branch).
+# Once the deployment has been performed by Vercel, we wait for its status to reach the "READY" state before doing anything else.defaults:
+# - Once ready, an HTTP call is sent to the webhook that is configured within the customer config file (VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK). (optional)
+# - Once ready, E2E tests are executed on the newly deployed domain (Cypress).
+# - Once ready, quality tests are executed on the newly deployed domain (LightHouse).
+#
+# This workflow can also be triggered using "Workflow Dispatch".
+#   See https://github.blog/changelog/2020-07-06-github-actions-manual-triggers-with-workflow_dispatch
+#   See https://docs.github.com/en/free-pro-team@latest/actions/reference/events-that-trigger-workflows#workflow_dispatch
+# This workflow can also be triggered using the API (uses Workflow Dispatch in the background).
+#   See src/pages/api/startVercelDeployment.ts
+#
+# LEARN MORE AT https://unlyed.github.io/next-right-now/guides/ci-cd/
+#
+# Dependencies overview:
+# - See https://github.com/actions/setup-node https://github.com/actions/setup-node/tree/v1
+# - See https://github.com/actions/checkout https://github.com/actions/checkout/tree/v1
+# - See https://github.com/actions/upload-artifact https://github.com/actions/upload-artifact/tree/v1
+# - See https://github.com/rlespinasse/github-slug-action https://github.com/rlespinasse/github-slug-action/tree/3.x
+# - See https://github.com/jwalton/gh-find-current-pr https://github.com/jwalton/gh-find-current-pr/tree/v1
+# - See https://github.com/peter-evans/create-or-update-comment https://github.com/peter-evans/create-or-update-comment/tree/v1
+# - See https://github.com/UnlyEd/github-action-await-vercel https://github.com/UnlyEd/github-action-await-vercel/tree/v1.1.1
+# - See https://github.com/UnlyEd/github-action-store-variable https://github.com/UnlyEd/github-action-store-variable/tree/v1.0.1
+# - See https://github.com/cypress-io/github-action https://github.com/cypress-io/github-action/tree/v2
+# - See https://github.com/foo-software/lighthouse-check-action https://github.com/foo-software/lighthouse-check-action/tree/v1.0.1
+
+name: Deploy to Vercel (staging)
+
+on:
+  # There are several ways to trigger Github actions - See https://help.github.com/en/actions/reference/events-that-trigger-workflows#example-using-a-single-event for a comprehensive list:
+  # - "push": Triggers each time a commit is pushed
+  # - "pull_request": Triggers each time a commit is pushed within a pull request, it makes it much easier to write comments within the PR, but it suffers some strong limitations:
+  #   - There is no way to trigger when a PR is merged into another - See https://github.community/t/pull-request-action-does-not-run-on-merge/16092?u=vadorequest
+  #   - It won't trigger when the PR is conflicting with its base branch - See https://github.community/t/run-actions-on-pull-requests-with-merge-conflicts/17104/2?u=vadorequest
+  push: # Triggers on each pushed commit
+    branches-ignore:
+      - 'master'
+      - 'main'
+      - 'v2-mst-aptd-at-lcz-sty' # XXX Name of the NRN preset branch, acting as a main branch (all commits pushed to the preset branch are deployed to production)
+
+  # Allow manual trigger via a button in github or a HTTP call - See https://docs.github.com/en/actions/configuring-and-managing-workflows/configuring-a-workflow#manually-running-a-workflow
+  # XXX See https://unlyed.github.io/next-right-now/guides/ci-cd/gha-deploy-vercel#triggering-the-action-remotely-using-workflow_dispatch
+  workflow_dispatch:
+    inputs:
+      customer:
+        description: 'Customer to deploy'
+        required: true
+
+jobs:
+  # Configures the deployment environment, install dependencies (like node, npm, etc.) that are requirements for the upcoming jobs
+  # Ex: Necessary to run `yarn deploy`
+  setup-environment:
+    name: Setup deployment environment (Ubuntu 18.04 - Node 12.x)
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Installing node.js
+        uses: actions/setup-node@v1 # Used to install node environment - https://github.com/actions/setup-node
+        with:
+          node-version: '12.x' # Use the same node.js version as the one Vercel's uses (currently node12.x)
+
+  # Starts a Vercel deployment, using the staging configuration file of the default institution
+  # The default institution is the one defined in the `vercel.json` file (which is a symlink to the actual file)
+  # N.B: It's Vercel that will perform the actual deployment
+  start-staging-deployment:
+    name: Starts Vercel deployment (staging) (Ubuntu 18.04)
+    runs-on: ubuntu-18.04
+    needs: setup-environment
+    timeout-minutes: 40 # Limit current job timeout https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes
+    steps:
+      - uses: actions/checkout@v1 # Get last commit pushed - See https://github.com/actions/checkout
+      - name: Deploying on Vercel (staging)
+        # Workflow overview:
+        #   - Resolve customer to deploy from github event input (falls back to resolving it from vercel.json file)
+        #   - Resolve $VERCEL_DEPLOYMENT_URL
+        #   - Get stdout from deploy command (stderr prints build steps and stdout prints deployment url, which is what we are really looking for)
+        #   - Set the deployment url that will be included in the eventual PR comment
+        #   - Create a deployment alias based on the branch name, and link it to the deployment (so that each branch has its own domain automatically aliased to the latest commit)
+        #   - Creates multiple deployment aliases based on the "alias" property defined in the vercel.json file, and link them to the deployment
+        # XXX You can use https://jqplay.org/ if you want to play around with "jq" to manipulate JSON
+        run: |
+          # Print the version of the "vercel" CLI being used (helps debugging)
+          vercel --version
+          echo "Deploying using git commit SHA: $GIT_COMMIT_SHA and branch/tag: $GIT_COMMIT_REF"
+
+          # Resolving customer to deploy based on the github event input, when using manual deployment triggerer through "workflow_dispatch" event
+          # Falls back to the customer specified in the vercel.json file, which is most useful when deployment is triggered through "push" event
+          MANUAL_TRIGGER_CUSTOMER="${{ github.event.inputs.customer}}"
+          echo "MANUAL_TRIGGER_CUSTOMER: " $MANUAL_TRIGGER_CUSTOMER
+          echo "MANUAL_TRIGGER_CUSTOMER=$MANUAL_TRIGGER_CUSTOMER" >> $GITHUB_ENV
+
+          CUSTOMER_REF_TO_DEPLOY="${MANUAL_TRIGGER_CUSTOMER:-$(cat vercel.json | jq --raw-output '.build.env.NEXT_PUBLIC_CUSTOMER_REF')}"
+          echo "Customer to deploy: " $CUSTOMER_REF_TO_DEPLOY
+          echo "CUSTOMER_REF_TO_DEPLOY=$CUSTOMER_REF_TO_DEPLOY" >> $GITHUB_ENV
+
+          # Deploy the customer on Vercel using the customer ref
+          # Store the output in a variable so we can extract metadata from it
+          VERCEL_DEPLOYMENT_OUTPUT=`GIT_COMMIT_REF=${GIT_COMMIT_REF} GIT_COMMIT_SHA=${GIT_COMMIT_SHA} CUSTOMER_REF=${CUSTOMER_REF_TO_DEPLOY} yarn deploy:ci:gha --token $VERCEL_TOKEN`
+
+          # Extract the Vercel deployment url from the deployment output
+          VERCEL_DEPLOYMENT_URL=`echo $VERCEL_DEPLOYMENT_OUTPUT | egrep -o 'https?://[^ ]+.vercel.app'`
+          echo "Deployment url: " $VERCEL_DEPLOYMENT_URL
+          echo "VERCEL_DEPLOYMENT_URL=$VERCEL_DEPLOYMENT_URL" >> $GITHUB_ENV
+          echo "VERCEL_DEPLOYMENT_DOMAIN=${VERCEL_DEPLOYMENT_URL#https://}" >> $GITHUB_ENV
+
+          # Build the alias domain based on our own rules (NRN own rules)
+          # Basically, if a branch starts with "v[0-9]" then we consider it to be a "preset branch" and we use the branch name as alias (e.g: "v2-mst-xxx")
+          # Otherwise, we use the deployment name and suffix it using the branch name (e.g: "v2-mst-xxx-branch-name")
+          if [[ ${GIT_COMMIT_REF##*/} =~ ^v[0-9]{1,}- ]]; then # Checking if pattern matches with "vX-" where X is a number
+            VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS=${GIT_COMMIT_REF##*/}
+          else
+            VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS=$(cat vercel.$CUSTOMER_REF_TO_DEPLOY.staging.json | jq --raw-output '.name')-${GIT_COMMIT_REF##*/}
+          fi
+          echo "Resolved domain alias: " $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS
+
+          # Vercel alias only allows 41 characters in the domain name, so we only keep the first 41 (41 = 53 - 11 - 1) characters (because Vercel needs 7 chars for ".vercel.app" at the end of the domain name, and count starts at 1, not 0)
+          # Also, in order to remove forbidden characters, we transform every characters which are not a "alnum" and \n or \r into '-'
+          VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS=$(echo $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS | head -c 41 | tr -c '[:alnum:]\r\n' - | tr '[:upper:]' '[:lower:]')
+          echo "Sanitized domain alias (1): " $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS
+
+          # Recursively remove any trailing dash ('-') to protect against invalid alias domain (not allowed to end with a trailing slash)
+          while [[ "$VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS" == *- ]]
+          do
+            VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS=${VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS::-1}
+          done
+          echo "Sanitized domain alias (2): " $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS
+
+          # Build alias url
+          VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS="${VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS}.vercel.app"
+          echo "VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS=$VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS" >> $GITHUB_ENV
+          echo "Alias domain: "$VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS
+          echo "Aliasing the deployment using the git branch alias:"
+          echo "npx vercel alias "$VERCEL_DEPLOYMENT_URL $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS
+
+          # Create Vercel alias, use "||" to allow failure (keep the build going) even if the alias fails
+          VERCEL_ALIASING_OUTPUT=`npx vercel alias $VERCEL_DEPLOYMENT_URL $VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS --token $VERCEL_TOKEN || echo "Aliasing failed for '$VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS', but the build will continue regardless."`
+          echo $VERCEL_ALIASING_OUTPUT
+          # TODO Resolve whether the aliasing has worked and change the GitHub comment "Comment PR (Deployment success)"
+
+          # Find all custom aliases configured in the customer deployment configuration file (vercel.json)
+          VERCEL_DEPLOYMENT_ALIASES_JSON=$(cat vercel.$CUSTOMER_REF_TO_DEPLOY.staging.json | jq --raw-output '.alias')
+          echo "Custom aliases: " $VERCEL_DEPLOYMENT_ALIASES_JSON
+
+          if [[ "$VERCEL_DEPLOYMENT_ALIASES_JSON" != "null" ]]; then
+            # Convert the JSON array into a bash array - See https://unix.stackexchange.com/a/615717/60329
+            readarray -t VERCEL_DEPLOYMENT_ALIASES < <(jq --raw-output '.alias[]' < vercel.$CUSTOMER_REF_TO_DEPLOY.staging.json)
+
+            # Count the number of element in the array, will be 0 if it's an empty array, or if the "alias" key wasn't defined
+            VERCEL_DEPLOYMENT_ALIASES_COUNT=${#VERCEL_DEPLOYMENT_ALIASES[@]}
+
+            # Check if there are no aliases configured
+            if [ "$VERCEL_DEPLOYMENT_ALIASES_COUNT" > 0 ]
+            then
+              echo "$VERCEL_DEPLOYMENT_ALIASES_COUNT alias(es) found. Aliasing them now..."
+
+              # For each alias configured, then assign it to the deployed domain
+              for DEPLOYMENT_ALIAS in "${VERCEL_DEPLOYMENT_ALIASES[@]}"; do
+                echo "npx vercel alias "$VERCEL_DEPLOYMENT_URL $DEPLOYMENT_ALIAS
+                npx vercel alias $VERCEL_DEPLOYMENT_URL $DEPLOYMENT_ALIAS --token $VERCEL_TOKEN || echo "Aliasing failed for '$DEPLOYMENT_ALIAS', but the build will continue regardless."
+              done
+            else
+              # $VERCEL_DEPLOYMENT_ALIASES is null, this happens when it was not defined in the vercel.json file
+              echo "There are no more aliases to configure. You can add more aliases from your vercel.json 'alias' property. See https://vercel.com/docs/configuration?query=alias%20domain#project/alias"
+              echo "$VERCEL_DEPLOYMENT_ALIASES"
+            fi
+          fi
+
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }} # Passing github's secret to the worker
+          GIT_COMMIT_REF: ${{ github.ref }} # Passing current branch/tag to the worker
+          GIT_COMMIT_SHA: ${{ github.sha }} # Passing current commit SHA to the worker
+
+      # We need to find the PR id. Will be used later to comment on that PR.
+      - name: Finding Pull Request ID
+        uses: jwalton/gh-find-current-pr@v1 # See https://github.com/jwalton/gh-find-current-pr
+        id: pr_id_finder
+        if: always() # It forces the job to be always executed, even if a previous job fail.
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # On deployment failure, add a comment to the PR, if there is an open PR for the current branch
+      - name: Comment PR (Deployment failure)
+        uses: peter-evans/create-or-update-comment@v1 # See https://github.com/peter-evans/create-or-update-comment
+        if: steps.pr_id_finder.outputs.number && failure()
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ steps.pr_id_finder.outputs.number }}
+          body: |
+            :x:&nbsp; Deployment **FAILED**
+            Commit ${{ github.sha }} failed to deploy to [${{ env.VERCEL_DEPLOYMENT_URL }}](${{ env.VERCEL_DEPLOYMENT_URL }})
+            [click to see logs](https://github.com/UnlyEd/next-right-now/pull/${{ steps.pr_id_finder.outputs.number }}/checks)
+
+      # On deployment success, add a comment to the PR, if there is an open PR for the current branch
+      - name: Comment PR (Deployment success)
+        uses: peter-evans/create-or-update-comment@v1 # See https://github.com/peter-evans/create-or-update-comment
+        if: steps.pr_id_finder.outputs.number && success()
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ steps.pr_id_finder.outputs.number }}
+          body: |
+            :white_check_mark:&nbsp; Deployment **SUCCESS**
+            Commit ${{ github.sha }} successfully deployed to [${{ env.VERCEL_DEPLOYMENT_URL }}](${{ env.VERCEL_DEPLOYMENT_URL }})
+            Deployment aliased as [${{ env.VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS }}](https://${{ env.VERCEL_DEPLOYMENT_AUTO_BRANCH_ALIAS }})
+
+      # At the end of the job, store all variables we will need in the following jobs
+      # The variables will be stored in and retrieved from a GitHub Artifact (each variable is stored in a different file)
+      - name: Store variables for next jobs
+        uses: UnlyEd/github-action-store-variable@v1.0.1 # See https://github.com/UnlyEd/github-action-store-variable
+        with:
+          variables: |
+            CUSTOMER_REF_TO_DEPLOY=${{ env.CUSTOMER_REF_TO_DEPLOY }}
+            VERCEL_DEPLOYMENT_URL=${{ env.VERCEL_DEPLOYMENT_URL }}
+            VERCEL_DEPLOYMENT_DOMAIN=${{ env.VERCEL_DEPLOYMENT_DOMAIN }}
+            MANUAL_TRIGGER_CUSTOMER=${{ env.MANUAL_TRIGGER_CUSTOMER }}
+            GITHUB_PULL_REQUEST_ID=${{ steps.pr_id_finder.outputs.number }}
+
+  # Waits for the Vercel deployment to reach "READY" state, so that other actions will be applied on a domain that is really online
+  await-for-vercel-deployment:
+    name: Await current deployment to be ready (Ubuntu 18.04)
+    runs-on: ubuntu-18.04
+    needs: start-staging-deployment
+    timeout-minutes: 5 # Limit current job timeout (including action timeout setup down there) https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes
+    steps:
+      - uses: actions/checkout@v1 # Get last commit pushed - See https://github.com/actions/checkout
+
+      # Restore variables stored by previous jobs
+      - name: Restore variables
+        uses: UnlyEd/github-action-store-variable@v1.0.1 # See https://github.com/UnlyEd/github-action-store-variable
+        id: restore-variable
+        with:
+          variables: |
+            VERCEL_DEPLOYMENT_DOMAIN
+
+      # Wait for deployment to be ready, before running E2E (otherwise Cypress might start testing too early, and gets redirected to Vercel's "Login page", and tests fail)
+      - name: Awaiting Vercel deployment to be ready
+        uses: UnlyEd/github-action-await-vercel@v1.1.1 # See https://github.com/UnlyEd/github-action-await-vercel
+        id: await-vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEl_TOKEN }}
+        with:
+          deployment-url: ${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_DOMAIN }} # Must only contain the domain name (no http prefix, etc.)
+          timeout: 90 # Wait for 90 seconds before failing
+
+      - name: Display deployment status
+        run: "echo The deployment is ${{ fromJson(steps.await-vercel.outputs.deploymentDetails).readyState }}"
+
+  # Send a HTTP call to the webhook url that's provided in the customer configuration file (vercel.*.json)
+  send-webhook-callback-once-deployment-ready:
+    name: Invoke webhook callback url defined by the customer (Ubuntu 18.04)
+    runs-on: ubuntu-18.04
+    needs: await-for-vercel-deployment
+    timeout-minutes: 5 # Limit current job timeout https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes
+    steps:
+      - uses: actions/checkout@v1 # Get last commit pushed - See https://github.com/actions/checkout
+      - name: Expose GitHub slug/short variables # See https://github.com/rlespinasse/github-slug-action#exposed-github-environment-variables
+        uses: rlespinasse/github-slug-action@v3.x # See https://github.com/rlespinasse/github-slug-action
+
+      # Restore variables stored by previous jobs
+      - name: Restore variables
+        uses: UnlyEd/github-action-store-variable@v1.0.1 # See https://github.com/UnlyEd/github-action-store-variable
+        id: restore-variable
+        with:
+          variables: |
+            MANUAL_TRIGGER_CUSTOMER
+            CUSTOMER_REF_TO_DEPLOY
+
+      - name: Expose git environment variables and call webhook (if provided)
+        # Workflow overview:
+        #  - Resolves webhook url from customer config file
+        #  - If a webhook url was defined in the customer config file, send an HTTP request, as POST request, with a JSON request body dynamically generated
+        #  - Prints the headers of the POST HTTP request (curl)
+        # TODO Convert this into an external bash script if possible, to simplify this step as much as possible
+        run: |
+          VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK=$(cat vercel.$CUSTOMER_REF_TO_DEPLOY.staging.json | jq --raw-output '.build.env.VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK')
+          echo "Vercel deployment webhook url: " $VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK
+
+          # Checking if a webhook url is defined
+          if [ -n "$VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK" ]; then
+            # Run script that populates git-related variables as ENV variables
+            echo "Running script populate-git-env.sh"
+            . ./scripts/populate-git-env.sh
+
+            echo "Resolved git variables:"
+            echo "'GIT_COMMIT_SHA': $GIT_COMMIT_SHA"
+            echo "'GIT_COMMIT_REF': $GIT_COMMIT_REF"
+            echo "'GIT_COMMIT_TAGS': $GIT_COMMIT_TAGS"
+
+            # Generates JSON using a bash function - See https://stackoverflow.com/a/57369772/2391795
+            # "End Of File" must be at the beginning of the line with no space/tab before or after - See https://stackoverflow.com/a/12909284/2391795
+            # But, when executed by GitHub Action, it must be inside the "run" section instead
+            generate_post_data() {
+              cat <<EOF
+            {
+              "MANUAL_TRIGGER_CUSTOMER": "${MANUAL_TRIGGER_CUSTOMER}",
+              "CUSTOMER_REF": "${CUSTOMER_REF_TO_DEPLOY}",
+              "STAGE": "staging",
+              "GIT_COMMIT_SHA": "${GIT_COMMIT_SHA}",
+              "GIT_COMMIT_REF": "${GIT_COMMIT_REF}",
+              "GIT_COMMIT_TAGS": "${GIT_COMMIT_TAGS}",
+              "GITHUB_REF_SLUG": "${GITHUB_REF_SLUG}",
+              "GITHUB_HEAD_REF_SLUG": "${GITHUB_HEAD_REF_SLUG}",
+              "GITHUB_BASE_REF_SLUG": "${GITHUB_BASE_REF_SLUG}",
+              "GITHUB_EVENT_REF_SLUG": "${GITHUB_EVENT_REF_SLUG}",
+              "GITHUB_REPOSITORY_SLUG": "${GITHUB_REPOSITORY_SLUG}",
+              "GITHUB_REF_SLUG_URL": "${GITHUB_REF_SLUG_URL}",
+              "GITHUB_HEAD_REF_SLUG_URL": "${GITHUB_HEAD_REF_SLUG_URL}",
+              "GITHUB_BASE_REF_SLUG_URL": "${GITHUB_BASE_REF_SLUG_URL}",
+              "GITHUB_EVENT_REF_SLUG_URL": "${GITHUB_EVENT_REF_SLUG_URL}",
+              "GITHUB_REPOSITORY_SLUG_URL": "${GITHUB_REPOSITORY_SLUG_URL}",
+              "GITHUB_SHA_SHORT": "${GITHUB_SHA_SHORT}"
+            }
+          EOF
+            }
+
+            echo "Print generate_post_data():"
+            echo "$(generate_post_data)"
+
+            echo "Calling webhook at '$VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK'"
+            echo "Sending HTTP request (curl):"
+            curl POST \
+              "$VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK" \
+              -vs \
+              --header "Accept: application/json" \
+              --header "Content-type: application/json" \
+              --data "$(generate_post_data)" \
+              2>&1 | sed '/^* /d; /bytes data]$/d; s/> //; s/< //'
+
+            # XXX See https://stackoverflow.com/a/54225157/2391795
+            # -vs - add headers (-v) but remove progress bar (-s)
+            # 2>&1 - combine stdout and stderr into single stdout
+            # sed - edit response produced by curl using the commands below
+            #   /^* /d - remove lines starting with '* ' (technical info)
+            #   /bytes data]$/d - remove lines ending with 'bytes data]' (technical info)
+            #   s/> // - remove '> ' prefix
+            #   s/< // - remove '< ' prefix
+
+          else
+            echo "No webhook url defined in 'vercel.$CUSTOMER_REF_TO_DEPLOY.staging.json:.build.env.VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK' (found '$VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK')"
+          fi
+        env:
+          CUSTOMER_REF_TO_DEPLOY: ${{ fromJson(steps.restore-variable.outputs.variables).CUSTOMER_REF_TO_DEPLOY }}
+          GIT_COMMIT_REF: ${{ github.ref }} # Passing current branch/tag to the worker
+          GIT_COMMIT_SHA: ${{ github.sha }} # Passing current commit SHA to the worker
+          # Passing exposed GitHub environment variables - See https://github.com/rlespinasse/github-slug-action#exposed-github-environment-variables
+          GITHUB_REF_SLUG: ${{ env.GITHUB_REF_SLUG }}
+          GITHUB_HEAD_REF_SLUG: ${{ env.GITHUB_HEAD_REF_SLUG }}
+          GITHUB_BASE_REF_SLUG: ${{ env.GITHUB_BASE_REF_SLUG }}
+          GITHUB_EVENT_REF_SLUG: ${{ env.GITHUB_EVENT_REF_SLUG }}
+          GITHUB_REPOSITORY_SLUG: ${{ env.GITHUB_REPOSITORY_SLUG }}
+          GITHUB_REF_SLUG_URL: ${{ env.GITHUB_REF_SLUG_URL }}
+          GITHUB_HEAD_REF_SLUG_URL: ${{ env.GITHUB_HEAD_REF_SLUG_URL }}
+          GITHUB_BASE_REF_SLUG_URL: ${{ env.GITHUB_BASE_REF_SLUG_URL }}
+          GITHUB_EVENT_REF_SLUG_URL: ${{ env.GITHUB_EVENT_REF_SLUG_URL }}
+          GITHUB_REPOSITORY_SLUG_URL: ${{ env.GITHUB_REPOSITORY_SLUG_URL }}
+          GITHUB_SHA_SHORT: ${{ env.GITHUB_SHA_SHORT }}
+
+  # Runs E2E tests against the Vercel deployment
+  run-2e2-tests:
+    name: Run end to end (E2E) tests (Ubuntu 18.04)
+    runs-on: ubuntu-18.04
+    # Docker image with Cypress pre-installed
+    # https://github.com/cypress-io/cypress-docker-images/tree/master/included
+    container: cypress/included:3.8.3
+    needs: await-for-vercel-deployment
+    timeout-minutes: 20 # Limit current job timeout https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes
+    steps:
+      - uses: actions/checkout@v1 # Get last commit pushed - See https://github.com/actions/checkout
+
+      # Restore variables stored by previous jobs
+      - name: Restore variables
+        uses: UnlyEd/github-action-store-variable@v1.0.1 # See https://github.com/UnlyEd/github-action-store-variable
+        id: restore-variable
+        with:
+          variables: |
+            VERCEL_DEPLOYMENT_URL
+            GITHUB_PULL_REQUEST_ID
+
+      # Runs the E2E tests against the new Vercel deployment
+      - name: Run E2E tests (Cypress)
+        uses: cypress-io/github-action@v2 # See https://github.com/cypress-io/github-action
+        with:
+          # XXX We disabled "wait-on" option, because it's useless. Cypress will fail anyway, because it gets redirected to some internal Vercel URL if the domain isn't yet available - See https://github.com/cypress-io/github-action/issues/270
+          # wait-on: '${{ env.VERCEL_DEPLOYMENT_URL }}' # Be sure that the endpoint is ready by pinging it before starting tests, using a default timeout of 60 seconds
+          config-file: 'cypress/config-customer-ci-cd.json' # Use Cypress config file for CI/CD, and override it below
+          config: baseUrl=${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }} # Overriding baseUrl provided by config file to test the new deployment
+        env:
+          # Enables Cypress debugging logs, very useful if Cypress crashes, like out-of-memory issues.
+          # DEBUG: "cypress:*" # Enable all logs. See https://docs.cypress.io/guides/references/troubleshooting.html#Print-DEBUG-logs
+          DEBUG: "cypress:server:util:process_profiler" # Enable logs for "memory and CPU usage". See https://docs.cypress.io/guides/references/troubleshooting.html#Log-memory-and-CPU-usage
+
+      # On E2E failure, upload screenshots
+      - name: Upload screenshots artifacts (E2E failure)
+        uses: actions/upload-artifact@v1 # On failure we upload artifacts, https://help.github.com/en/actions/automating-your-workflow-with-github-actions/persisting-workflow-data-using-artifacts
+        if: failure()
+        with:
+          name: screenshots
+          path: cypress/screenshots/
+
+      # On E2E failure, upload videos
+      - name: Upload videos artifacts (E2E failure)
+        uses: actions/upload-artifact@v1 # On failure we upload artifacts, https://help.github.com/en/actions/automating-your-workflow-with-github-actions/persisting-workflow-data-using-artifacts
+        if: failure()
+        with:
+          name: videos
+          path: cypress/videos/
+
+      # On E2E failure, add a comment to the PR with additional information, if there is an open PR for the current branch
+      - name: Comment PR (E2E failure)
+        uses: peter-evans/create-or-update-comment@v1 # See https://github.com/peter-evans/create-or-update-comment
+        if: fromJson(steps.restore-variable.outputs.variables).GITHUB_PULL_REQUEST_ID && failure()
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ fromJson(steps.restore-variable.outputs.variables).GITHUB_PULL_REQUEST_ID }}
+          body: |
+            :x:&nbsp; E2E tests **FAILED** for commit ${{ github.sha }} previously deployed at [${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }}](${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }})
+            Download artifacts (screenshots + videos) from [`checks`](https://github.com/UnlyEd/next-right-now/pull/${{ fromJson(steps.restore-variable.outputs.variables).GITHUB_PULL_REQUEST_ID }}/checks) section
+
+      # On E2E success, add a comment to the PR, if there is an open PR for the current branch
+      - name: Comment PR (E2E success)
+        uses: peter-evans/create-or-update-comment@v1 # See https://github.com/peter-evans/create-or-update-comment
+        if: fromJson(steps.restore-variable.outputs.variables).GITHUB_PULL_REQUEST_ID && success()
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          issue-number: ${{ fromJson(steps.restore-variable.outputs.variables).GITHUB_PULL_REQUEST_ID }}
+          body: |
+            :white_check_mark:&nbsp; E2E tests **SUCCESS** for commit ${{ github.sha }} previously deployed at [${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }}](${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }})
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Runs LightHouse reports in parallel of E2E tests
+  run-lighthouse-tests:
+    name: Run LightHouse checks (Ubuntu 18.04)
+    runs-on: ubuntu-18.04
+    needs: await-for-vercel-deployment
+    timeout-minutes: 5 # Limit current job timeout https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#jobsjob_idtimeout-minutes
+    steps:
+      - uses: actions/checkout@v1 # Get last commit pushed - See https://github.com/actions/checkout
+
+      # To store reports and then upload them, we must create the folder beforehand
+      - name: Create temporary folder for artifacts storage
+        run: mkdir /tmp/lighthouse-artifacts
+
+      # Restore variables stored by previous jobs
+      - name: Restore variables
+        uses: UnlyEd/github-action-store-variable@v1.0.1 # See https://github.com/UnlyEd/github-action-store-variable
+        id: restore-variable
+        with:
+          variables: VERCEL_DEPLOYMENT_URL
+
+      # Runs LightHouse for a given url and create HTML reports in the specified directory (outputDirectory)
+      # Action documentation: https://github.com/marketplace/actions/lighthouse-check#usage-standard-example
+      - name: Run Lighthouse
+        uses: foo-software/lighthouse-check-action@v2.0.5
+        id: lighthouseCheck
+        with: # See https://github.com/marketplace/actions/lighthouse-check#inputs for all options
+          accessToken: ${{ secrets.GITHUB_TOKEN }} # Providing a token to comment the PR if you are using a "pull_request" as trigger, or using "commentUrl" option.
+          commentUrl: https://api.github.com/repos/UnlyEd/next-right-now/commits/${{ github.sha }}/comments
+          prCommentEnabled: true # Whether to comment on the PR (default: true). Disabled because we use our own "Comment PR (LightHouse report)" action
+          prCommentSaveOld: true # If true, then add a new comment for each commit. Otherwise, update the latest comment (default: false).
+          outputDirectory: /tmp/lighthouse-artifacts # Used to upload artifacts.
+          emulatedFormFactor: all # Run LightHouse against "mobile", "desktop", or "all" devices
+          urls: ${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }}, ${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }}/en, ${{ fromJson(steps.restore-variable.outputs.variables).VERCEL_DEPLOYMENT_URL }}/fr
+          locale: en
+
+      # Upload HTML report created by lighthouse as an artifact.
+      # XXX Disable this if you don't use them, as they are a bit heavy (~3MB) and might cost you money, if you're using a private repository
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v1
+        with:
+          name: Lighthouse reports
+          path: /tmp/lighthouse-artifacts
+
+      # Using a pre-build action to make the action fail if your score is too low. It can be really interesting to track a low score on a commit
+      # You can remove this action IF you don't want lighthouse to be a blocking point in your CI
+      # Official documentation: https://github.com/foo-software/lighthouse-check-status-action
+      - name: Handle Lighthouse Check results
+        uses: foo-software/lighthouse-check-status-action@v1.0.1 # See https://github.com/foo-software/lighthouse-check-action
+        with:
+          lighthouseCheckResults: ${{ steps.lighthouseCheck.outputs.lighthouseCheckResults }}
+          minAccessibilityScore: "50"
+          minBestPracticesScore: "50"
+          minPerformanceScore: "30"
+          minProgressiveWebAppScore: "50"
+          minSeoScore: "50"

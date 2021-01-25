@@ -1,0 +1,28 @@
+{
+  "version": 2,
+  "name": "nrn-v2-mst-aptd-at-lcz-sty-c1",
+  "scope": "team_qnVfSEVc2WwmOE1OYhZr4VST",
+  "env": {},
+  "build": {
+    "env": {
+      "NEXT_PUBLIC_APP_STAGE": "staging",
+      "NEXT_PUBLIC_NRN_PRESET": "v2-mst-aptd-at-lcz-sty",
+      "NEXT_PUBLIC_CUSTOMER_REF": "customer1",
+      "NEXT_PUBLIC_LOCIZE_PROJECT_ID": "@nrn-locize-project-id",
+      "NEXT_PUBLIC_AMPLITUDE_API_KEY": "@nrn-amplitude-api-key-staging",
+      "AIRTABLE_API_KEY": "@nrn-airtable-api-key",
+      "AIRTABLE_BASE_ID": "@nrn-airtable-base-id",
+      "LOCIZE_API_KEY": "@nrn-locize-api-key-staging",
+      "SENTRY_DSN": "@nrn-sentry-dsn",
+      "GITHUB_DISPATCH_TOKEN": "@nrn-github-dispatch-token",
+      "VERCEL_DEPLOYMENT_COMPLETED_WEBHOOK": "https://nrn-v2-mst-aptd-at-lcz-sty-c1-preview.vercel.app/api/webhooks/deploymentCompleted"
+}
+  },
+  "alias": [
+    "nrn-v2-mst-aptd-at-lcz-sty-c1-preview.vercel.app"
+  ],
+  "regions": [
+    "all"
+  ],
+  "public": false
+}
